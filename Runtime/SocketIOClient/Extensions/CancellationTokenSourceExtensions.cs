@@ -1,4 +1,4 @@
-﻿using System.Threading;
+using System.Threading;
 
 namespace SocketIOClient.Extensions
 {
@@ -15,6 +15,16 @@ namespace SocketIOClient.Extensions
             {
                 cts.Cancel();
             }
+        }
+
+        public static CancellationTokenSourceWrapper Renew(this CancellationTokenSourceWrapper cts)
+        {
+            if (cts != null)
+            {
+                cts.Dispose();
+            }
+
+            return new CancellationTokenSourceWrapper(new CancellationTokenSource());
         }
     }
 }

@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Net.Http;
 using System.Net.WebSockets;
@@ -110,6 +110,8 @@ namespace SocketIOClient
         List<OnAnyHandler> _onAnyHandlers;
         Dictionary<string, Action<SocketIOResponse>> _eventHandlers;
         double _reconnectionDelay;
+        bool _exitFromBackground;
+        readonly SemaphoreSlim _packetIdLock = new SemaphoreSlim(1, 1);
 
         #region Socket.IO event
 
@@ -136,7 +138,7 @@ namespace SocketIOClient
         public event EventHandler<Exception> OnReconnectError;
 
         /// <summary>
-        /// Fired when couldn’t reconnect within reconnectionAttempts
+        /// Fired when couldn't reconnect within reconnectionAttempts
         /// </summary>
         public event EventHandler OnReconnectFailed;
 
@@ -202,6 +204,7 @@ namespace SocketIOClient
             {
                 Transport.SetProxy(Options.Proxy);
             }
+
             Transport.OnReceived = OnMessageReceived;
             Transport.OnError = OnErrorReceived;
         }
@@ -252,8 +255,10 @@ namespace SocketIOClient
 
         private void ConnectInBackground(CancellationToken cancellationToken)
         {
+            _reconnectionDelay = Options.ReconnectionDelay;
             Task.Factory.StartNew(async () =>
             {
+                _exitFromBackground = false;
                 while (true)
                 {
                     if (cancellationToken.IsCancellationRequested)
@@ -274,11 +279,20 @@ namespace SocketIOClient
                     }
                     catch (Exception e)
                     {
+                        OnReconnectError.TryInvoke(this, e);
                         var needBreak = await AttemptAsync(e);
-                        if (needBreak) break;
+                        if (needBreak)
+                        {
+                            _exitFromBackground = true;
+                            break;
+                        }
 
                         var canHandle = CanHandleException(e);
-                        if (!canHandle) throw;
+                        if (!canHandle)
+                        {
+                            _exitFromBackground = true;
+                            throw;
+                        }
                     }
                 }
             }, cancellationToken);
@@ -286,11 +300,6 @@ namespace SocketIOClient
 
         private async Task<bool> AttemptAsync(Exception e)
         {
-            if (_attempts > 0)
-            {
-                OnReconnectError.TryInvoke(this, e);
-            }
-
             _attempts++;
             if (_attempts <= Options.ReconnectionAttempts)
             {
@@ -319,7 +328,14 @@ namespace SocketIOClient
         {
             if (_expectedExceptions.Contains(e.GetType()))
             {
-                if (!Options.Reconnection)
+                if (Options.Reconnection)
+                {
+                    if (_attempts > Options.ReconnectionAttempts)
+                    {
+                        return false;
+                    }
+                }
+                else
                 {
                     _backgroundException = e;
                     return false;
@@ -360,13 +376,11 @@ namespace SocketIOClient
         }
 
         private readonly SemaphoreSlim _connectingLock = new SemaphoreSlim(1, 1);
-        private CancellationTokenSource _connCts;
+        private CancellationTokenSourceWrapper _connCts;
 
         private void ConnectInBackground()
         {
-            _connCts.TryCancel();
-            _connCts.TryDispose();
-            _connCts = new CancellationTokenSource();
+            _connCts = _connCts.Renew();
             ConnectInBackground(_connCts.Token);
         }
 
@@ -379,7 +393,6 @@ namespace SocketIOClient
 
                 ConnectInBackground();
 
-                var ms = 0;
                 while (true)
                 {
                     if (_connCts.IsCancellationRequested)
@@ -392,11 +405,15 @@ namespace SocketIOClient
                         throw new ConnectionException($"Cannot connect to server '{ServerUri}'", _backgroundException);
                     }
 
-                    ms += 100;
-                    if (ms > Options.ConnectionTimeout.TotalMilliseconds)
+                    if (Options.Reconnection && _attempts > Options.ReconnectionAttempts)
                     {
-                        throw new ConnectionException($"Cannot connect to server '{ServerUri}'",
-                            new TimeoutException());
+                        throw new ConnectionException(
+                            $"Cannot connect to server '{ServerUri}' after {_attempts} attempts.");
+                    }
+
+                    if (_exitFromBackground)
+                    {
+                        throw new ConnectionException($"Cannot connect to server '{ServerUri}'.");
                     }
 
                     await Task.Delay(100);
@@ -422,7 +439,7 @@ namespace SocketIOClient
         {
             Id = msg.Sid;
             Connected = true;
-            _connCts.Cancel();
+            _connCts.Dispose();
             OnConnected.TryInvoke(this, EventArgs.Empty);
             if (_attempts > 0)
             {
@@ -466,6 +483,7 @@ namespace SocketIOClient
 
         private void ErrorMessageHandler(ErrorMessage msg)
         {
+            _connCts.Dispose();
             OnError.TryInvoke(this, msg.Message);
         }
 
@@ -553,7 +571,6 @@ namespace SocketIOClient
 
         public async Task DisconnectAsync()
         {
-            _connCts.TryCancel();
             _connCts.TryDispose();
             var msg = new DisconnectedMessage
             {
@@ -731,21 +748,36 @@ namespace SocketIOClient
             Action<SocketIOResponse> ack,
             params object[] data)
         {
-            _ackHandlers.Add(++_packetId, ack);
-            if (data != null && data.Length > 0)
+            try
             {
-                var result = JsonSerializer.Serialize(data);
-                if (result.Bytes.Count > 0)
+                await _packetIdLock.WaitAsync(cancellationToken).ConfigureAwait(false);
+                _ackHandlers.Add(++_packetId, ack);
+                if (data != null && data.Length > 0)
                 {
-                    var msg = new ClientBinaryAckMessage
+                    var result = JsonSerializer.Serialize(data);
+                    if (result.Bytes.Count > 0)
                     {
-                        Event = eventName,
-                        Namespace = Namespace,
-                        Json = result.Json,
-                        Id = _packetId,
-                        OutgoingBytes = new List<byte[]>(result.Bytes)
-                    };
-                    await Transport.SendAsync(msg, cancellationToken).ConfigureAwait(false);
+                        var msg = new ClientBinaryAckMessage
+                        {
+                            Event = eventName,
+                            Namespace = Namespace,
+                            Json = result.Json,
+                            Id = _packetId,
+                            OutgoingBytes = new List<byte[]>(result.Bytes)
+                        };
+                        await Transport.SendAsync(msg, cancellationToken).ConfigureAwait(false);
+                    }
+                    else
+                    {
+                        var msg = new ClientAckMessage
+                        {
+                            Event = eventName,
+                            Namespace = Namespace,
+                            Id = _packetId,
+                            Json = result.Json
+                        };
+                        await Transport.SendAsync(msg, cancellationToken).ConfigureAwait(false);
+                    }
                 }
                 else
                 {
@@ -753,31 +785,29 @@ namespace SocketIOClient
                     {
                         Event = eventName,
                         Namespace = Namespace,
-                        Id = _packetId,
-                        Json = result.Json
+                        Id = _packetId
                     };
                     await Transport.SendAsync(msg, cancellationToken).ConfigureAwait(false);
                 }
             }
-            else
+            finally
             {
-                var msg = new ClientAckMessage
-                {
-                    Event = eventName,
-                    Namespace = Namespace,
-                    Id = _packetId
-                };
-                await Transport.SendAsync(msg, cancellationToken).ConfigureAwait(false);
+                _packetIdLock.Release();
             }
         }
 
+        private readonly SemaphoreSlim _disconnectingLock = new SemaphoreSlim(1, 1);
+
         private async Task InvokeDisconnect(string reason)
         {
-            if (Connected)
+            try
             {
-                Connected = false;
-                Id = null;
-                OnDisconnected.TryInvoke(this, reason);
+                await _disconnectingLock.WaitAsync();
+                if (!Connected)
+                {
+                    return;
+                }
+
                 try
                 {
                     await Transport.DisconnectAsync(CancellationToken.None).ConfigureAwait(false);
@@ -789,6 +819,9 @@ namespace SocketIOClient
 #endif
                 }
 
+                Connected = false;
+                Id = null;
+                OnDisconnected.TryInvoke(this, reason);
                 if (reason != DisconnectReason.IOServerDisconnect && reason != DisconnectReason.IOClientDisconnect)
                 {
                     //In the this cases (explicit disconnection), the client will not try to reconnect and you need to manually call socket.connect().
@@ -797,6 +830,10 @@ namespace SocketIOClient
                         ConnectInBackground();
                     }
                 }
+            }
+            finally
+            {
+                _disconnectingLock.Release();
             }
         }
 
@@ -810,7 +847,6 @@ namespace SocketIOClient
 
         public void Dispose()
         {
-            _connCts.TryCancel();
             _connCts.TryDispose();
             Transport.TryDispose();
             _ackHandlers.Clear();
